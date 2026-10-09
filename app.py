@@ -11,7 +11,9 @@ import io
 import json
 import os
 import re
+import time
 
+import pypdfium2 as pdfium
 import streamlit as st
 from docx import Document
 from google import genai
@@ -22,6 +24,8 @@ from pypdf import PdfReader
 # Config
 # --------------------------------------------------------------------------
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite")
+RETRY_DELAYS = (2, 5, 10)  # seconds to wait between retries on temporary errors
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000  # keeps prompts small and fast
 MIN_RESUME_CHARS = 150  # below this the file is probably scanned / empty
@@ -69,19 +73,42 @@ JSON_SHAPE = """{
 # --------------------------------------------------------------------------
 # Text extraction
 # --------------------------------------------------------------------------
+def _looks_spaced_out(text: str) -> bool:
+    """Detect broken extraction like 'H A R I S  A Y U B' (one char per token)."""
+    tokens = text.split()
+    if len(tokens) < 20:
+        return False
+    return sum(len(t) == 1 for t in tokens) / len(tokens) > 0.6
+
+
+def _extract_pdf(data: bytes) -> str:
+    """Extract PDF text with pdfium (clean), falling back to pypdf."""
+    text = ""
+    try:
+        pdf = pdfium.PdfDocument(data)
+        text = "\n".join(page.get_textpage().get_text_range() for page in pdf)
+    except Exception as exc:
+        if "password" in str(exc).lower():
+            raise ValueError("This PDF is password-protected.")
+    if len(text.strip()) >= MIN_RESUME_CHARS and not _looks_spaced_out(text):
+        return text
+
+    reader = PdfReader(io.BytesIO(data))
+    if reader.is_encrypted:
+        try:
+            reader.decrypt("")
+        except Exception:
+            raise ValueError("This PDF is password-protected.")
+    fallback = "\n".join((page.extract_text() or "") for page in reader.pages)
+    return fallback if len(fallback.strip()) > len(text.strip()) else text
+
+
 def extract_text(file_name: str, data: bytes) -> str:
     """Return plain text from a PDF, DOCX or TXT upload."""
     name = file_name.lower()
 
     if name.endswith(".pdf"):
-        reader = PdfReader(io.BytesIO(data))
-        if reader.is_encrypted:
-            try:
-                reader.decrypt("")
-            except Exception:
-                raise ValueError("This PDF is password-protected.")
-        pages = [(page.extract_text() or "") for page in reader.pages]
-        text = "\n".join(pages)
+        text = _extract_pdf(data)
 
     elif name.endswith(".docx"):
         doc = Document(io.BytesIO(data))
@@ -98,6 +125,7 @@ def extract_text(file_name: str, data: bytes) -> str:
     else:
         raise ValueError("Unsupported file type. Please upload a PDF, DOCX or TXT.")
 
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -216,24 +244,65 @@ def parse_analysis(raw: str) -> dict:
     }
 
 
-def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str = "") -> dict:
-    """Send the resume to Gemini and return the normalised analysis."""
-    client = genai.Client(api_key=api_key)
+def is_temporary_error(exc: Exception) -> bool:
+    """True for overload / rate-limit style errors that are worth retrying."""
+    low = str(exc).lower()
+    return any(
+        marker in low
+        for marker in ("503", "unavailable", "overloaded", "high demand", "500", "internal", "429", "resource_exhausted", "deadline")
+    )
+
+
+def _generate(client, model: str, prompt: str) -> str:
     response = client.models.generate_content(
         model=model,
-        contents=build_prompt(resume_text, job_description),
+        contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             response_mime_type="application/json",
         ),
     )
-    return parse_analysis(response.text or "")
+    return response.text or ""
+
+
+def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str = "") -> dict:
+    """Send the resume to Gemini (with retries + fallback model) and return the analysis."""
+    client = genai.Client(api_key=api_key)
+    prompt = build_prompt(resume_text, job_description)
+
+    models = [model]
+    if FALLBACK_MODEL and FALLBACK_MODEL != model:
+        models.append(FALLBACK_MODEL)
+
+    last_exc = None
+    for current in models:
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            try:
+                return parse_analysis(_generate(client, current, prompt))
+            except ValueError as exc:  # bad / empty JSON: one more try is cheap
+                last_exc = exc
+                if attempt >= 1:
+                    break
+            except Exception as exc:
+                last_exc = exc
+                if not is_temporary_error(exc):
+                    raise  # real problem (bad key, bad model name): don't hide it
+                if attempt < len(RETRY_DELAYS):
+                    time.sleep(RETRY_DELAYS[attempt])
+        # retries exhausted for this model -> try the fallback model
+    raise last_exc
 
 
 def friendly_error(exc: Exception) -> str:
     """Turn API exceptions into messages a user can act on."""
     msg = str(exc)
     low = msg.lower()
+    if "503" in low or "unavailable" in low or "high demand" in low or "overloaded" in low:
+        return (
+            "Google's Gemini servers are overloaded right now (this is temporary and not "
+            "your fault). The app already retried and tried a backup model. "
+            "Please wait a minute and click Analyze again."
+        )
     if "api key" in low or "api_key" in low or "permission" in low or "401" in low or "403" in low:
         return "Your Gemini API key looks invalid or lacks permission. Please check it."
     if "429" in low or "quota" in low or "resource_exhausted" in low or "rate limit" in low:
@@ -410,3 +479,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+      
+  
