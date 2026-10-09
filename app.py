@@ -12,8 +12,6 @@ import json
 import os
 import re
 import time
-
-import pypdfium2 as pdfium
 import streamlit as st
 from docx import Document
 from google import genai
